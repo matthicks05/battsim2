@@ -1,0 +1,17 @@
+[package]
+name = "battsim2"
+version = "0.1.0"
+edition = "2021"
+authors = ["battsim2"]
+description = "battsim2 - Lithium-ion battery simulator with Modbus TCP interface and terminal UI"
+
+[dependencies]
+ratatui = "0.24"
+crossterm = "0.27"
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+tokio-modbus = "0.11"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-appender = "0.2"
