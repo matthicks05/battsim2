@@ -11,6 +11,14 @@ use crate::battery::types::*;
 /// a POI/site meter, and auxiliary/environmental data. See docs/MODBUS_MAP.md for the
 /// full address/type/scale/unit reference table.
 pub mod addresses {
+    // On the wire, Modbus TCP addresses are always 0-based within each function code's own
+    // address space (e.g. FC04 address 0 = "the first input register"). The 30001-/40001-style
+    // numbers below are the traditional Modicon documentation convention layered on top, NOT
+    // literal wire bytes — translate wire_address = internal_address - BASE (see server.rs's
+    // request handlers) rather than sending/expecting the 5-digit numbers over the wire.
+    pub const INPUT_REGISTER_BASE: u16 = 30001;
+    pub const HOLDING_REGISTER_BASE: u16 = 40001;
+
     // ============================================================
     // Input Registers (Read-Only) - Function Code 04
     // ============================================================

@@ -8,6 +8,7 @@ use tracing::{info, warn, error, debug};
 
 use crate::battery::types::*;
 use super::registers::ModbusRegisterMap;
+use super::registers::addresses::{HOLDING_REGISTER_BASE, INPUT_REGISTER_BASE};
 
 /// Modbus function codes
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -244,13 +245,14 @@ impl ModbusTcpServer {
             );
         }
 
-        let start_address = u16::from_be_bytes([request.data[0], request.data[1]]);
+        // Wire addresses are 0-based per Modbus TCP; translate to this map's internal 40001+ addressing.
+        let start_address = u16::from_be_bytes([request.data[0], request.data[1]]).saturating_add(HOLDING_REGISTER_BASE);
         let register_count = u16::from_be_bytes([request.data[2], request.data[3]]);
 
         if register_count > 125 || register_count == 0 {
             return self.create_exception_response(
                 request.transaction_id,
-                request.unit_id, 
+                request.unit_id,
                 request.function_code,
                 ExceptionCode::IllegalDataValue
             );
@@ -267,14 +269,15 @@ impl ModbusTcpServer {
         ModbusResponse {
             transaction_id: request.transaction_id,
             protocol_id: 0,
-            length: (3 + response_data.len()) as u16,
+            // MBAP Length = bytes following the Length field: UnitID(1) + FunctionCode(1) + data
+            length: (2 + response_data.len()) as u16,
             unit_id: request.unit_id,
             function_code: request.function_code,
             data: response_data,
         }
     }
 
-    /// Handle read input registers (function code 04)  
+    /// Handle read input registers (function code 04)
     async fn handle_read_input_registers(&self, request: ModbusRequest) -> ModbusResponse {
         if request.data.len() != 4 {
             return self.create_exception_response(
@@ -285,14 +288,15 @@ impl ModbusTcpServer {
             );
         }
 
-        let start_address = u16::from_be_bytes([request.data[0], request.data[1]]);
+        // Wire addresses are 0-based per Modbus TCP; translate to this map's internal 30001+ addressing.
+        let start_address = u16::from_be_bytes([request.data[0], request.data[1]]).saturating_add(INPUT_REGISTER_BASE);
         let register_count = u16::from_be_bytes([request.data[2], request.data[3]]);
 
         if register_count > 125 || register_count == 0 {
             return self.create_exception_response(
                 request.transaction_id,
                 request.unit_id,
-                request.function_code, 
+                request.function_code,
                 ExceptionCode::IllegalDataValue
             );
         }
@@ -308,7 +312,8 @@ impl ModbusTcpServer {
         ModbusResponse {
             transaction_id: request.transaction_id,
             protocol_id: 0,
-            length: (3 + response_data.len()) as u16,
+            // MBAP Length = bytes following the Length field: UnitID(1) + FunctionCode(1) + data
+            length: (2 + response_data.len()) as u16,
             unit_id: request.unit_id,
             function_code: request.function_code,
             data: response_data,
@@ -326,7 +331,8 @@ impl ModbusTcpServer {
             );
         }
 
-        let register_address = u16::from_be_bytes([request.data[0], request.data[1]]);
+        // Wire addresses are 0-based per Modbus TCP; translate to this map's internal 40001+ addressing.
+        let register_address = u16::from_be_bytes([request.data[0], request.data[1]]).saturating_add(HOLDING_REGISTER_BASE);
         let register_value = u16::from_be_bytes([request.data[2], request.data[3]]);
 
         // Write to register map
@@ -369,7 +375,8 @@ impl ModbusTcpServer {
             );
         }
 
-        let start_address = u16::from_be_bytes([request.data[0], request.data[1]]);
+        // Wire addresses are 0-based per Modbus TCP; translate to this map's internal 40001+ addressing.
+        let start_address = u16::from_be_bytes([request.data[0], request.data[1]]).saturating_add(HOLDING_REGISTER_BASE);
         let register_count = u16::from_be_bytes([request.data[2], request.data[3]]);
         let byte_count = request.data[4] as usize;
 
