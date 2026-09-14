@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
             voltage_limit_low: 44.0,
             soc_limit_high: 100.0,
             soc_limit_low: 0.0,
+            ..Default::default()
         };
         info!("ControlSetpoints test task: sending setpoints");
         control_test_tx.send(setpoints).await.unwrap();
@@ -94,11 +95,30 @@ async fn main() -> Result<()> {
     // Clone state manager for UI access
     let ui_state_manager = state_manager.clone();
     
-    // For now, create a dummy Modbus server without setpoints (to isolate the issue)
-    let (dummy_setpoints_tx, _dummy_setpoints_rx) = tokio::sync::mpsc::channel::<ControlSetpoints>(100);
-    let (dummy_config_tx, _dummy_config_rx) = tokio::sync::mpsc::channel::<BatteryConfig>(100);
-    let modbus_server = ModbusTcpServer::new(battery_rx.clone(), dummy_setpoints_tx, dummy_config_tx);
-    info!("Modbus server initialized with dummy channel");
+    // Modbus holding-register writes (setpoints/config) are delivered over these channels;
+    // apply them to the shared battery state so they actually reach the simulation.
+    let (setpoints_tx, mut setpoints_rx) = tokio::sync::mpsc::channel::<ControlSetpoints>(100);
+    let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<BatteryConfig>(100);
+    let modbus_server = ModbusTcpServer::new(battery_rx.clone(), setpoints_tx, config_tx);
+    info!("Modbus server initialized");
+
+    let setpoints_state_manager = state_manager.clone();
+    let _setpoints_apply_task = tokio::spawn(async move {
+        while let Some(setpoints) = setpoints_rx.recv().await {
+            if let Err(e) = setpoints_state_manager.update_setpoints(setpoints) {
+                error!("Failed to apply Modbus setpoints write: {}", e);
+            }
+        }
+    });
+
+    let config_state_manager = state_manager.clone();
+    let _config_apply_task = tokio::spawn(async move {
+        while let Some(config) = config_rx.recv().await {
+            if let Err(e) = config_state_manager.update_config(config) {
+                error!("Failed to apply Modbus config write: {}", e);
+            }
+        }
+    });
     
     // Start all concurrent tasks
     let _simulation_task = tokio::spawn(async move {

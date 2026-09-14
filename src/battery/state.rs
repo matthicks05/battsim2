@@ -55,6 +55,26 @@ impl BatteryStateManager {
         let _ = self.tx.send(state.clone());
         Ok(())
     }
+
+    /// Update AC-side (PCS) measurements
+    pub fn update_ac(&self, ac: AcParams) -> Result<()> {
+        let mut state = self.state.write()
+            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock"))?;
+        state.ac = ac;
+        self.update_timestamp()?;
+        let _ = self.tx.send(state.clone());
+        Ok(())
+    }
+
+    /// Update meter/POI measurements
+    pub fn update_meter(&self, meter: MeterParams) -> Result<()> {
+        let mut state = self.state.write()
+            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock"))?;
+        state.meter = meter;
+        self.update_timestamp()?;
+        let _ = self.tx.send(state.clone());
+        Ok(())
+    }
     
     /// Update system status
     pub fn update_status(&self, status: SystemStatus) -> Result<()> {
@@ -414,6 +434,7 @@ mod tests {
             soc: 75.2,
             available_energy: 376.0,
             remaining_capacity: 124.0,
+            ..Default::default()
         };
         
         manager.update_electrical(params.clone()).unwrap();

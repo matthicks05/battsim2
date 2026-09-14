@@ -78,26 +78,39 @@ impl BatterySimulator {
         
         // Calculate cell-level parameters
         let new_cells = self.calculate_cell_monitoring(&new_electrical, &current_state.config)?;
-        
+
+        // Update dynamic power limits (SOC/thermal derated)
+        self.update_power_limits(&mut new_electrical, &current_state.config)?;
+
         // Update system info (aging, resistance, etc.)
         let mut new_info = current_state.info.clone();
         self.update_aging(&mut new_info, &current_state, effective_dt)?;
-        
+        self.update_environment(&mut new_info, &current_state)?;
+
         // Update temperatures with thermal model
         self.update_thermal_model(&mut new_electrical, &new_cells, current_state.info.clone())?;
-        
+
         // Check for fault conditions
         let mut new_status = current_state.status.clone();
         self.check_fault_conditions(&new_electrical, &new_cells, &mut new_status)?;
-        
+
         // Apply setpoint commands
         self.apply_commands(&current_state.setpoints, &mut new_status)?;
+        self.apply_status_mirrors(&current_state.setpoints, &mut new_status);
+
+        // Calculate AC-side (PCS) parameters from the DC-side result
+        let new_ac = self.calculate_ac_params(&new_electrical, &new_status, &current_state.config)?;
+
+        // Calculate meter/POI parameters from the AC-side result
+        let new_meter = self.calculate_meter_params(&current_state.meter, &new_ac, &new_status, effective_dt)?;
 
         // Update state manager
         self.state_manager.update_electrical(new_electrical)?;
         self.state_manager.update_cells(new_cells)?;
         self.state_manager.update_info(new_info)?;
         self.state_manager.update_status(new_status)?;
+        self.state_manager.update_ac(new_ac)?;
+        self.state_manager.update_meter(new_meter)?;
         
         // Update timing
         self.state_manager.increment_uptime(dt)?;
@@ -137,18 +150,16 @@ impl BatterySimulator {
             let discriminant = b * b - 4.0 * a * c;
             
             if discriminant >= 0.0 {
-                // Take the solution that gives current in the right direction
+                // Both roots satisfy V*I - I²*R = P exactly, but they represent two very
+                // different operating points: a low-current/low-loss solution close to the
+                // naive P/V estimate, and a high-current/high-loss solution where most of the
+                // gross power is burned as I²R and only the remainder reaches the terminals.
+                // A real battery/PCS always regulates to the low-current solution, so we must
+                // pick the root with the smaller current magnitude, not just "a" valid root.
                 let i1 = (-b + discriminant.sqrt()) / (2.0 * a);
                 let i2 = (-b - discriminant.sqrt()) / (2.0 * a);
-                
-                // Choose current based on charge/discharge direction
-                params.current = if target_power > 0.0 {
-                    // Discharging (positive current)
-                    i1.max(i2)
-                } else {
-                    // Charging (negative current)
-                    i1.min(i2)
-                };
+
+                params.current = if i1.abs() <= i2.abs() { i1 } else { i2 };
                 
                 // Apply current limits
                 params.current = params.current.clamp(
@@ -196,8 +207,151 @@ impl BatterySimulator {
         let self_discharge_rate = 0.03 / (30.0 * 24.0); // Per hour
         let self_discharge = params.soc * self_discharge_rate * dt_hours;
         params.soc = (params.soc - self_discharge).max(0.0);
-        
+
+        // Track cumulative lifetime charge/discharge energy (never reset)
+        if params.power > 0.0 {
+            params.lifetime_discharge_energy += params.power * dt_hours;
+        } else if params.power < 0.0 {
+            params.lifetime_charge_energy += -params.power * dt_hours;
+        }
+
         Ok(())
+    }
+
+    /// Update dynamic charge/discharge power limits based on SOC headroom
+    fn update_power_limits(&self, params: &mut ElectricalParams, config: &BatteryConfig) -> Result<()> {
+        let charge_derate = if params.soc > 95.0 {
+            0.2
+        } else if params.soc > 90.0 {
+            0.6
+        } else {
+            1.0
+        };
+
+        let discharge_derate = if params.soc < 5.0 {
+            0.2
+        } else if params.soc < 10.0 {
+            0.6
+        } else {
+            1.0
+        };
+
+        params.max_charge_power = config.rated_power * charge_derate;
+        params.max_discharge_power = config.rated_power * discharge_derate;
+
+        Ok(())
+    }
+
+    /// Update ambient/enclosure temperature and auxiliary load reporting
+    fn update_environment(&self, info: &mut SystemInfo, state: &BatteryState) -> Result<()> {
+        info.ambient_temperature = self.temperature_ambient;
+        info.enclosure_temperature = self.temperature_ambient + 3.0;
+        info.aux_power_consumption = if state.status.state == SystemState::Offline {
+            0.0
+        } else {
+            2.5 // kW - controls, comms, lighting, cooling standby draw
+        };
+        Ok(())
+    }
+
+    /// Mirror a subset of write-only setpoints back into status for read-back
+    fn apply_status_mirrors(&self, setpoints: &ControlSetpoints, status: &mut SystemStatus) {
+        status.operating_mode = setpoints.operating_mode;
+        status.grid_connected = setpoints.grid_connect_command && status.state != SystemState::Offline;
+    }
+
+    /// Derive AC-side (PCS) measurements from the DC-side electrical result
+    fn calculate_ac_params(&self, electrical: &ElectricalParams, status: &SystemStatus, config: &BatteryConfig) -> Result<AcParams> {
+        const PCS_EFFICIENCY: f64 = 0.97;
+
+        let pcs_state = if !status.faults.is_empty() {
+            PcsState::Fault
+        } else {
+            match status.state {
+                SystemState::Offline => PcsState::Standby,
+                SystemState::Charging | SystemState::Discharging => PcsState::Running,
+                SystemState::Fault => PcsState::Fault,
+                _ => PcsState::Standby,
+            }
+        };
+
+        // Apply converter losses: discharging loses some power to AC, charging draws extra from AC
+        let real_power = if electrical.power > 0.0 {
+            electrical.power * PCS_EFFICIENCY
+        } else if electrical.power < 0.0 {
+            electrical.power / PCS_EFFICIENCY
+        } else {
+            0.0
+        };
+
+        let power_factor: f64 = if real_power.abs() > 0.1 { 0.99 } else { 1.0 };
+        let apparent_power = if power_factor.abs() > 0.0 { real_power.abs() / power_factor } else { 0.0 };
+        let reactive_magnitude = (apparent_power.powi(2) - real_power.powi(2)).max(0.0).sqrt();
+        let reactive_power = if real_power >= 0.0 { reactive_magnitude } else { -reactive_magnitude };
+
+        // Small grid frequency droop proportional to loading, typical of grid-following inverters
+        let loading_fraction = if config.rated_power > 0.0 { real_power / config.rated_power } else { 0.0 };
+        let frequency = (config.nominal_frequency - loading_fraction * 0.02).clamp(59.5, 60.5);
+
+        let voltage_ln = config.rated_ac_voltage / 3f64.sqrt();
+        let apparent_kva = apparent_power;
+        let current_per_phase = if voltage_ln > 0.0 {
+            (apparent_kva * 1000.0) / (3.0 * voltage_ln)
+        } else {
+            0.0
+        };
+
+        let pcs_temperature = self.temperature_ambient + (current_per_phase / 200.0) * 10.0;
+
+        Ok(AcParams {
+            pcs_state,
+            grid_forming: false,
+            frequency,
+            power_factor,
+            real_power,
+            reactive_power,
+            apparent_power,
+            voltage_l1n: voltage_ln,
+            voltage_l2n: voltage_ln,
+            voltage_l3n: voltage_ln,
+            current_l1: current_per_phase,
+            current_l2: current_per_phase,
+            current_l3: current_per_phase,
+            pcs_temperature,
+            isolation_resistance: 500.0,
+        })
+    }
+
+    /// Derive meter/POI measurements from the AC-side (PCS) result
+    fn calculate_meter_params(&self, previous_meter: &MeterParams, ac: &AcParams, status: &SystemStatus, dt_hours: f64) -> Result<MeterParams> {
+        let aux_load_power = if status.state == SystemState::Offline { 0.0 } else { 2.5 };
+        let real_power = ac.real_power - aux_load_power;
+        let apparent_power = if ac.power_factor.abs() > 0.0 { real_power.abs() / ac.power_factor.abs() } else { 0.0 };
+        let reactive_magnitude = (apparent_power.powi(2) - real_power.powi(2)).max(0.0).sqrt();
+        let reactive_power = if real_power >= 0.0 { reactive_magnitude } else { -reactive_magnitude };
+
+        let mut lifetime_import_energy = previous_meter.lifetime_import_energy;
+        let mut lifetime_export_energy = previous_meter.lifetime_export_energy;
+        if real_power > 0.0 {
+            lifetime_export_energy += real_power * dt_hours;
+        } else if real_power < 0.0 {
+            lifetime_import_energy += -real_power * dt_hours;
+        }
+
+        Ok(MeterParams {
+            voltage_l1n: ac.voltage_l1n,
+            voltage_l2n: ac.voltage_l2n,
+            voltage_l3n: ac.voltage_l3n,
+            current_l1: ac.current_l1,
+            current_l2: ac.current_l2,
+            current_l3: ac.current_l3,
+            frequency: ac.frequency,
+            real_power,
+            reactive_power,
+            lifetime_import_energy,
+            lifetime_export_energy,
+            aux_load_power,
+        })
     }
 
     /// Calculate cell-level monitoring data
@@ -213,13 +367,22 @@ impl BatterySimulator {
         let current_heating = (electrical.current.abs() / 100.0) * 5.0; // Heat from current
         let base_temp = self.temperature_ambient + current_heating;
         
+        let voltage_delta = voltage_variation * 2.0;
+        let balancing_cells = if voltage_delta > 0.03 {
+            (config.cell_count as f64 * 0.1).round() as u16
+        } else {
+            0
+        };
+
         Ok(CellMonitoring {
             voltage_min: avg_cell_voltage - voltage_variation,
             voltage_max: avg_cell_voltage + voltage_variation,
             voltage_avg: avg_cell_voltage,
+            voltage_delta,
             temp_min: base_temp - temp_variation,
             temp_max: base_temp + temp_variation,
             temp_avg: base_temp,
+            balancing_cells,
         })
     }
 
@@ -426,7 +589,7 @@ impl Default for BatterySimulator {
 mod tests {
     use super::*;
     use std::time::Duration;
-    
+
     #[tokio::test]
     async fn test_simulator_creation() {
         let sim = BatterySimulator::new();
