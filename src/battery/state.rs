@@ -11,6 +11,7 @@ use super::types::*;
 pub struct BatteryStateManager {
     state: Arc<RwLock<BatteryState>>,
     last_update: Arc<RwLock<Instant>>,
+    last_setpoints_update: Arc<RwLock<Instant>>,
     tx: watch::Sender<BatteryState>,
     rx: watch::Receiver<BatteryState>,
 }
@@ -20,10 +21,11 @@ impl BatteryStateManager {
     pub fn new() -> Self {
         let initial_state = BatteryState::default();
         let (tx, rx) = watch::channel(initial_state.clone());
-        
+
         Self {
             state: Arc::new(RwLock::new(initial_state)),
             last_update: Arc::new(RwLock::new(Instant::now())),
+            last_setpoints_update: Arc::new(RwLock::new(Instant::now())),
             tx,
             rx,
         }
@@ -75,6 +77,32 @@ impl BatteryStateManager {
         let _ = self.tx.send(state.clone());
         Ok(())
     }
+
+    /// Update the electrical/cells/info/status/ac/meter fields together under a
+    /// single lock acquisition, clone, and broadcast. The simulation loop calls
+    /// this once per tick instead of six separate update_* calls, each of which
+    /// independently locks, clones the whole BatteryState, and broadcasts.
+    pub fn update_all(
+        &self,
+        electrical: ElectricalParams,
+        cells: CellMonitoring,
+        info: SystemInfo,
+        status: SystemStatus,
+        ac: AcParams,
+        meter: MeterParams,
+    ) -> Result<()> {
+        let mut state = self.state.write()
+            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock"))?;
+        state.electrical = electrical;
+        state.cells = cells;
+        state.info = info;
+        state.status = status;
+        state.ac = ac;
+        state.meter = meter;
+        self.update_timestamp()?;
+        let _ = self.tx.send(state.clone());
+        Ok(())
+    }
     
     /// Update system status
     pub fn update_status(&self, status: SystemStatus) -> Result<()> {
@@ -98,22 +126,49 @@ impl BatteryStateManager {
     
     /// Update control setpoints
     pub fn update_setpoints(&self, setpoints: ControlSetpoints) -> Result<()> {
-        info!("State manager: Updating setpoints - power: {:.1} kW, command: {:?}", 
+        info!("State manager: Updating setpoints - power: {:.1} kW, command: {:?}",
               setpoints.power_setpoint, setpoints.command);
         let mut state = self.state.write()
             .map_err(|_| anyhow::anyhow!("Failed to acquire write lock"))?;
         state.setpoints = setpoints;
         self.update_timestamp()?;
+        {
+            let mut last_setpoints_update = self.last_setpoints_update.write()
+                .map_err(|_| anyhow::anyhow!("Failed to acquire write lock"))?;
+            *last_setpoints_update = Instant::now();
+        }
         let _ = self.tx.send(state.clone());
         debug!("State manager: Setpoints updated and broadcast");
         Ok(())
     }
-    
+
+    /// Time since the last setpoints write (used for watchdog-timeout fault detection)
+    pub fn time_since_setpoints_update(&self) -> Result<Duration> {
+        let last_setpoints_update = self.last_setpoints_update.read()
+            .map_err(|_| anyhow::anyhow!("Failed to acquire read lock"))?;
+        Ok(last_setpoints_update.elapsed())
+    }
+
     /// Update battery configuration
+    ///
+    /// `nominal_voltage`/`min_voltage`/`max_voltage` have no Modbus holding
+    /// registers of their own (see docs/MODBUS_MAP.md), so `extract_config_from_registers`
+    /// can never recover them and always rebuilds from `BatteryConfig::default()`.
+    /// Preserve the existing values for those three fields across every config
+    /// write instead of silently resetting them whenever any other config
+    /// register (e.g. RATED_POWER) is written.
     pub fn update_config(&self, config: BatteryConfig) -> Result<()> {
         let mut state = self.state.write()
             .map_err(|_| anyhow::anyhow!("Failed to acquire write lock"))?;
+        let preserved = (
+            state.config.nominal_voltage,
+            state.config.min_voltage,
+            state.config.max_voltage,
+        );
         state.config = config;
+        state.config.nominal_voltage = preserved.0;
+        state.config.min_voltage = preserved.1;
+        state.config.max_voltage = preserved.2;
         self.update_timestamp()?;
         let _ = self.tx.send(state.clone());
         Ok(())
@@ -400,12 +455,28 @@ mod tests {
     fn test_state_manager_creation() {
         let manager = BatteryStateManager::new();
         let state = manager.get_state().unwrap();
-        
+
         assert_eq!(state.electrical.voltage, 400.0);
         assert_eq!(state.status.state, SystemState::Standby);
         assert!(state.status.faults.is_empty());
     }
-    
+
+    #[test]
+    fn test_update_config_preserves_non_addressable_voltage_fields() {
+        let manager = BatteryStateManager::new();
+        manager.init_voltage(420.0).unwrap();
+
+        // Simulate a Modbus config write: extract_config_from_registers has no
+        // register for nominal_voltage/min/max_voltage, so it always rebuilds
+        // them from BatteryConfig::default() - update_config must not let that
+        // silently reset the operator's customized voltage.
+        manager.update_config(BatteryConfig::default()).unwrap();
+
+        let state = manager.get_state().unwrap();
+        assert_eq!(state.config.nominal_voltage, 420.0, "nominal_voltage must survive an unrelated config write");
+    }
+
+
     #[test]
     fn test_fault_management() {
         let manager = BatteryStateManager::new();

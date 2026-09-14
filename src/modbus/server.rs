@@ -39,21 +39,30 @@ fn translate_address(wire_addr: u16, base: u16, count: u16) -> Result<u16, Excep
 }
 
 /// Applies a holding-register write to the register map, then forwards a
-/// setpoints/config update to the simulation if the write landed in one of
-/// those ranges (mirrors the pre-migration hand-rolled dispatch).
+/// setpoints/config update to the simulation if the write touched one of
+/// those ranges (mirrors the pre-migration hand-rolled dispatch). Takes the
+/// whole written range at once - `extract_setpoints_from_registers`/
+/// `extract_config_from_registers` always re-read the full struct regardless
+/// of which specific register changed, so a multi-register write only needs
+/// to trigger each at most once, not once per register touched.
 fn send_register_updates(
     register_map: &ModbusRegisterMap,
-    changed_address: u16,
+    start_address: u16,
+    count: u16,
     setpoints_tx: &tokio::sync::mpsc::Sender<ControlSetpoints>,
     config_tx: &tokio::sync::mpsc::Sender<BatteryConfig>,
 ) {
-    if (40001..=40100).contains(&changed_address) {
+    // translate_address() already guaranteed start_address + count fits in u16.
+    let end_address = start_address + count - 1;
+
+    if start_address <= 40100 && end_address >= 40001 {
         if let Ok(setpoints) = register_map.extract_setpoints_from_registers() {
             if setpoints_tx.try_send(setpoints).is_err() {
                 tracing::debug!("Setpoints channel full, skipping update");
             }
         }
-    } else if (40101..=40200).contains(&changed_address) {
+    }
+    if start_address <= 40200 && end_address >= 40101 {
         if let Ok(config) = register_map.extract_config_from_registers() {
             if config_tx.try_send(config).is_err() {
                 tracing::debug!("Config channel full, skipping update");
@@ -109,7 +118,7 @@ impl Service for BattsimService {
                     {
                         let mut map = register_map.write().await;
                         let _ = map.write_holding_register(internal_addr, value);
-                        send_register_updates(&map, internal_addr, &setpoints_tx, &config_tx);
+                        send_register_updates(&map, internal_addr, 1, &setpoints_tx, &config_tx);
                     }
                     // Echo back the original wire address, not the translated one.
                     Ok(Response::WriteSingleRegister(addr, value))
@@ -123,9 +132,7 @@ impl Service for BattsimService {
                     {
                         let mut map = register_map.write().await;
                         let _ = map.write_holding_registers(internal_addr, &values);
-                        for i in 0..count {
-                            send_register_updates(&map, internal_addr + i, &setpoints_tx, &config_tx);
-                        }
+                        send_register_updates(&map, internal_addr, count, &setpoints_tx, &config_tx);
                     }
                     Ok(Response::WriteMultipleRegisters(addr, count))
                 }
