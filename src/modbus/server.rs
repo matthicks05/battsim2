@@ -7,6 +7,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, RwLock};
+use tokio::time::Duration;
+use tokio_io_timeout::TimeoutStream;
 use tokio_modbus::server::tcp::Server;
 use tokio_modbus::server::Service;
 use tokio_modbus::{Exception, Request, Response};
@@ -17,6 +19,24 @@ use crate::battery::types::*;
 use crate::battery::BatteryStateManager;
 use super::registers::addresses::{HOLDING_REGISTER_BASE, INPUT_REGISTER_BASE};
 use super::registers::ModbusRegisterMap;
+
+/// A client that goes idle for this long (no bytes read) has its connection
+/// closed, releasing the socket and correcting MODBUS_CLIENT_COUNT — matches
+/// the pre-migration hand-rolled server's idle-read timeout.
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Translates a 0-based wire address into this map's internal 30001+/40001+
+/// addressing, rejecting anything that would overflow u16 arithmetic
+/// downstream (both here and in the `start_address..start_address+count`
+/// range math in `registers.rs`) instead of silently saturating to a wrong
+/// address or panicking on overflow.
+fn translate_address(wire_addr: u16, base: u16, count: u16) -> Result<u16, Exception> {
+    let internal_addr = wire_addr.checked_add(base).ok_or(Exception::IllegalDataAddress)?;
+    internal_addr
+        .checked_add(count)
+        .ok_or(Exception::IllegalDataAddress)?;
+    Ok(internal_addr)
+}
 
 /// Applies a holding-register write to the register map, then forwards a
 /// setpoints/config update to the simulation if the write landed in one of
@@ -70,8 +90,7 @@ impl Service for BattsimService {
                     if count == 0 || count > 125 {
                         return Err(Exception::IllegalDataValue);
                     }
-                    // Wire addresses are 0-based per Modbus TCP; translate to this map's internal 40001+ addressing.
-                    let internal_addr = addr.saturating_add(HOLDING_REGISTER_BASE);
+                    let internal_addr = translate_address(addr, HOLDING_REGISTER_BASE, count)?;
                     let map = register_map.read().await;
                     let values = map.read_holding_registers(internal_addr, count);
                     Ok(Response::ReadHoldingRegisters(values))
@@ -80,14 +99,13 @@ impl Service for BattsimService {
                     if count == 0 || count > 125 {
                         return Err(Exception::IllegalDataValue);
                     }
-                    // Wire addresses are 0-based per Modbus TCP; translate to this map's internal 30001+ addressing.
-                    let internal_addr = addr.saturating_add(INPUT_REGISTER_BASE);
+                    let internal_addr = translate_address(addr, INPUT_REGISTER_BASE, count)?;
                     let map = register_map.read().await;
                     let values = map.read_input_registers(internal_addr, count);
                     Ok(Response::ReadInputRegisters(values))
                 }
                 Request::WriteSingleRegister(addr, value) => {
-                    let internal_addr = addr.saturating_add(HOLDING_REGISTER_BASE);
+                    let internal_addr = translate_address(addr, HOLDING_REGISTER_BASE, 1)?;
                     {
                         let mut map = register_map.write().await;
                         let _ = map.write_holding_register(internal_addr, value);
@@ -100,8 +118,8 @@ impl Service for BattsimService {
                     if values.is_empty() || values.len() > 123 {
                         return Err(Exception::IllegalDataValue);
                     }
-                    let internal_addr = addr.saturating_add(HOLDING_REGISTER_BASE);
                     let count = values.len() as u16;
+                    let internal_addr = translate_address(addr, HOLDING_REGISTER_BASE, count)?;
                     {
                         let mut map = register_map.write().await;
                         let _ = map.write_holding_registers(internal_addr, &values);
@@ -212,7 +230,7 @@ impl ModbusTcpServer {
         let client_count = self.client_count.clone();
         let state_manager = self.state_manager.clone();
 
-        let on_connected = move |_stream: TcpStream, peer_addr: SocketAddr| {
+        let on_connected = move |stream: TcpStream, peer_addr: SocketAddr| {
             let inner = service.clone();
             let client_count = client_count.clone();
             let state_manager = state_manager.clone();
@@ -222,6 +240,14 @@ impl ModbusTcpServer {
                     error!("Failed to update Modbus client count: {}", e);
                 }
                 info!("New Modbus client connected from {}", peer_addr);
+
+                let mut timeout_stream = TimeoutStream::new(stream);
+                timeout_stream.set_read_timeout(Some(CLIENT_IDLE_TIMEOUT));
+                // TimeoutStream isn't Unpin (it holds a pinned `Sleep` internally),
+                // but Server::serve requires an Unpin transport; Pin<Box<T>> is
+                // always Unpin regardless of T, so box-pin it after configuring.
+                let timeout_stream = Box::pin(timeout_stream);
+
                 Ok(Some((
                     ConnectionService {
                         inner,
@@ -229,7 +255,7 @@ impl ModbusTcpServer {
                         state_manager,
                         peer_addr,
                     },
-                    _stream,
+                    timeout_stream,
                 )))
             }
         };
@@ -335,5 +361,25 @@ mod tests {
         req.slave = 99;
         let result = service.call(req).await;
         assert_eq!(result, Err(Exception::ServerDeviceFailure));
+    }
+
+    #[tokio::test]
+    async fn test_out_of_range_address_rejected_not_panicking() {
+        let service = make_service();
+        // Translating this wire address (65500) into internal 30001+ addressing
+        // would overflow u16 arithmetic downstream if not caught up front.
+        let result = service
+            .call(slave_request(Request::ReadInputRegisters(65500, 50)))
+            .await;
+        assert_eq!(result, Err(Exception::IllegalDataAddress));
+    }
+
+    #[tokio::test]
+    async fn test_write_out_of_range_address_rejected_not_panicking() {
+        let service = make_service();
+        let result = service
+            .call(slave_request(Request::WriteSingleRegister(65530, 1)))
+            .await;
+        assert_eq!(result, Err(Exception::IllegalDataAddress));
     }
 }

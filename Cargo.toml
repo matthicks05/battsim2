@@ -11,6 +11,7 @@ crossterm = "0.27"
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 tokio-modbus = { version = "0.11", default-features = false, features = ["tcp-server"] }
+tokio-io-timeout = "1.2.1"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
