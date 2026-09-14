@@ -433,7 +433,13 @@ impl Default for ControlSetpoints {
             power_factor_setpoint: 1.0,
             operating_mode: OperatingMode::Auto,
             grid_connect_command: true,
-            watchdog_timeout: 30,
+            // Disabled by default: nothing in this codebase (or a typical EMS that
+            // only writes setpoints on change, not on a fixed heartbeat) guarantees
+            // periodic setpoint writes, so a non-zero default self-trips the
+            // WatchdogTimeout fault during completely normal idle operation. An EMS
+            // that wants this protection opts in by writing a non-zero value here
+            // and committing to a matching periodic write cadence.
+            watchdog_timeout: 0,
         }
     }
 }

@@ -48,49 +48,21 @@ impl BatteryStateManager {
         Ok(())
     }
     
-    /// Update cell monitoring data
-    pub fn update_cells(&self, cells: CellMonitoring) -> Result<()> {
-        let mut state = self.state.write()
-            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock"))?;
-        state.cells = cells;
-        self.update_timestamp()?;
-        let _ = self.tx.send(state.clone());
-        Ok(())
-    }
-
-    /// Update AC-side (PCS) measurements
-    pub fn update_ac(&self, ac: AcParams) -> Result<()> {
-        let mut state = self.state.write()
-            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock"))?;
-        state.ac = ac;
-        self.update_timestamp()?;
-        let _ = self.tx.send(state.clone());
-        Ok(())
-    }
-
-    /// Update meter/POI measurements
-    pub fn update_meter(&self, meter: MeterParams) -> Result<()> {
-        let mut state = self.state.write()
-            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock"))?;
-        state.meter = meter;
-        self.update_timestamp()?;
-        let _ = self.tx.send(state.clone());
-        Ok(())
-    }
-
-    /// Update the electrical/cells/info/status/ac/meter fields together under a
-    /// single lock acquisition, clone, and broadcast. The simulation loop calls
-    /// this once per tick instead of six separate update_* calls, each of which
-    /// independently locks, clones the whole BatteryState, and broadcasts.
+    /// Update the electrical/cells/info/status/ac/meter fields (plus accumulated
+    /// operating uptime) together under a single lock acquisition, clone, and
+    /// broadcast. The simulation loop calls this once per tick instead of
+    /// separately locking/cloning/broadcasting for each field.
     pub fn update_all(
         &self,
         electrical: ElectricalParams,
         cells: CellMonitoring,
         info: SystemInfo,
-        status: SystemStatus,
+        mut status: SystemStatus,
         ac: AcParams,
         meter: MeterParams,
+        uptime_delta: Duration,
     ) -> Result<()> {
+        status.uptime += uptime_delta;
         let mut state = self.state.write()
             .map_err(|_| anyhow::anyhow!("Failed to acquire write lock"))?;
         state.electrical = electrical;
@@ -103,27 +75,7 @@ impl BatteryStateManager {
         let _ = self.tx.send(state.clone());
         Ok(())
     }
-    
-    /// Update system status
-    pub fn update_status(&self, status: SystemStatus) -> Result<()> {
-        let mut state = self.state.write()
-            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock"))?;
-        state.status = status;
-        self.update_timestamp()?;
-        let _ = self.tx.send(state.clone());
-        Ok(())
-    }
-    
-    /// Update system info
-    pub fn update_info(&self, info: SystemInfo) -> Result<()> {
-        let mut state = self.state.write()
-            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock"))?;
-        state.info = info;
-        self.update_timestamp()?;
-        let _ = self.tx.send(state.clone());
-        Ok(())
-    }
-    
+
     /// Update control setpoints
     pub fn update_setpoints(&self, setpoints: ControlSetpoints) -> Result<()> {
         info!("State manager: Updating setpoints - power: {:.1} kW, command: {:?}",
@@ -406,16 +358,6 @@ impl BatteryStateManager {
         let mut state = self.state.write()
             .map_err(|_| anyhow::anyhow!("Failed to acquire write lock"))?;
         state.status.state = new_state;
-        self.update_timestamp()?;
-        let _ = self.tx.send(state.clone());
-        Ok(())
-    }
-    
-    /// Increment uptime
-    pub fn increment_uptime(&self, duration: Duration) -> Result<()> {
-        let mut state = self.state.write()
-            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock"))?;
-        state.status.uptime += duration;
         self.update_timestamp()?;
         let _ = self.tx.send(state.clone());
         Ok(())

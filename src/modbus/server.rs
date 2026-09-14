@@ -52,10 +52,13 @@ fn send_register_updates(
     setpoints_tx: &tokio::sync::mpsc::Sender<ControlSetpoints>,
     config_tx: &tokio::sync::mpsc::Sender<BatteryConfig>,
 ) {
-    // translate_address() already guaranteed start_address + count fits in u16.
+    // translate_address() already guaranteed start_address + count fits in u16, and
+    // start_address is always the already-translated internal address (wire_addr +
+    // HOLDING_REGISTER_BASE), so it's always >= 40001 - only the upper bound matters
+    // for the setpoints range.
     let end_address = start_address + count - 1;
 
-    if start_address <= 40100 && end_address >= 40001 {
+    if start_address <= 40100 {
         if let Ok(setpoints) = register_map.extract_setpoints_from_registers() {
             if setpoints_tx.try_send(setpoints).is_err() {
                 tracing::debug!("Setpoints channel full, skipping update");

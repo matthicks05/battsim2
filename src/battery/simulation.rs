@@ -84,17 +84,20 @@ impl BatterySimulator {
         // status/config (AC, meter, power limits, environment) so those registers
         // reflect the offline state instead of freezing at stale pre-shutdown values.
         if current_state.status.state == SystemState::Offline {
+            // Resolve status first so everything derived from it below (environment,
+            // AC, meter) agrees on the same tick's state - a command here (Start) can
+            // move the system out of Offline on this very tick.
+            let mut new_status = current_state.status.clone();
+            self.apply_commands(&current_state.setpoints, &mut new_status)?;
+            self.apply_status_mirrors(&current_state.setpoints, &mut new_status);
+
             let mut new_electrical = current_state.electrical.clone();
             new_electrical.current = 0.0;
             new_electrical.power = 0.0;
             self.update_power_limits(&mut new_electrical, &current_state.config)?;
 
             let mut new_info = current_state.info.clone();
-            self.update_environment(&mut new_info, &current_state)?;
-
-            let mut new_status = current_state.status.clone();
-            self.apply_commands(&current_state.setpoints, &mut new_status)?;
-            self.apply_status_mirrors(&current_state.setpoints, &mut new_status);
+            self.update_environment(&mut new_info, new_status.state)?;
 
             let new_ac = self.calculate_ac_params(&new_electrical, &new_status, &current_state.config)?;
             let new_meter = self.calculate_meter_params(&current_state.meter, &new_ac, &new_status, dt_hours)?;
@@ -106,6 +109,7 @@ impl BatterySimulator {
                 new_status,
                 new_ac,
                 new_meter,
+                Duration::ZERO,
             )?;
             return Ok(());
         }
@@ -129,7 +133,6 @@ impl BatterySimulator {
         // Update system info (aging, resistance, etc.)
         let mut new_info = current_state.info.clone();
         self.update_aging(&mut new_info, &current_state, effective_dt)?;
-        self.update_environment(&mut new_info, &current_state)?;
 
         // Update temperatures with thermal model
         self.update_thermal_model(&mut new_electrical, &new_cells, current_state.info.clone())?;
@@ -142,18 +145,18 @@ impl BatterySimulator {
         self.apply_commands(&current_state.setpoints, &mut new_status)?;
         self.apply_status_mirrors(&current_state.setpoints, &mut new_status);
 
+        // Environment/aux-load reporting uses the *resolved* status (above), not the
+        // pre-tick one, so it agrees with the AC/meter aux load on a Stop/Start tick.
+        self.update_environment(&mut new_info, new_status.state)?;
+
         // Calculate AC-side (PCS) parameters from the DC-side result
         let new_ac = self.calculate_ac_params(&new_electrical, &new_status, &current_state.config)?;
 
         // Calculate meter/POI parameters from the AC-side result
         let new_meter = self.calculate_meter_params(&current_state.meter, &new_ac, &new_status, effective_dt)?;
 
-        // Update state manager - one lock/clone/broadcast for the whole tick
-        // instead of six separate update_* calls.
-        self.state_manager.update_all(new_electrical, new_cells, new_info, new_status, new_ac, new_meter)?;
-
-        // Update timing
-        self.state_manager.increment_uptime(dt)?;
+        // Update state manager - one lock/clone/broadcast for the whole tick.
+        self.state_manager.update_all(new_electrical, new_cells, new_info, new_status, new_ac, new_meter, dt)?;
         self.last_update = Instant::now();
 
         Ok(())
@@ -286,11 +289,15 @@ impl BatterySimulator {
         Ok(())
     }
 
-    /// Update ambient/enclosure temperature and auxiliary load reporting
-    fn update_environment(&self, info: &mut SystemInfo, state: &BatteryState) -> Result<()> {
+    /// Update ambient/enclosure temperature and auxiliary load reporting. Takes the
+    /// tick's *resolved* SystemState (after apply_commands/check_fault_conditions),
+    /// not the pre-tick one - otherwise AUX_POWER_CONSUMPTION and the AC/meter aux
+    /// load (which do use the resolved status) disagree for one tick on every
+    /// Offline<->operating transition.
+    fn update_environment(&self, info: &mut SystemInfo, system_state: SystemState) -> Result<()> {
         info.ambient_temperature = self.temperature_ambient;
         info.enclosure_temperature = self.temperature_ambient + 3.0;
-        info.aux_power_consumption = aux_load_power(state.status.state);
+        info.aux_power_consumption = aux_load_power(system_state);
         Ok(())
     }
 
@@ -561,8 +568,12 @@ impl BatterySimulator {
 
         // EMS comms watchdog: self-clearing, since a stale watchdog is a liveness signal
         // rather than a hardware fault - it should recover on its own once writes resume.
-        // watchdog_timeout == 0 means the watchdog is disabled.
-        if setpoints.watchdog_timeout > 0 {
+        // watchdog_timeout == 0 means the watchdog is disabled, which must also clear
+        // any watchdog fault already latched (disabling it is how an EMS says "ignore
+        // this", not "freeze whatever fault state happened to be active").
+        if setpoints.watchdog_timeout == 0 {
+            status.faults.retain(|f| *f != FaultCode::WatchdogTimeout);
+        } else {
             let stale = self
                 .state_manager
                 .time_since_setpoints_update()
@@ -755,10 +766,61 @@ mod tests {
         assert!(state.status.faults.contains(&FaultCode::WatchdogTimeout), "expected a stale watchdog to fault");
 
         // A fresh setpoints write resets the watchdog; it should self-clear.
-        sim.state_manager.update_setpoints(setpoints).unwrap();
+        sim.state_manager.update_setpoints(setpoints.clone()).unwrap();
         sim.update(Duration::from_millis(100)).await.unwrap();
         let state = sim.state_manager.get_state().unwrap();
         assert!(!state.status.faults.contains(&FaultCode::WatchdogTimeout), "watchdog fault should self-clear once writes resume");
+
+        // Disabling the watchdog (0) must also clear an already-latched fault, not
+        // just skip raising new ones.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        sim.update(Duration::from_millis(100)).await.unwrap();
+        assert!(sim.state_manager.get_state().unwrap().status.faults.contains(&FaultCode::WatchdogTimeout));
+
+        setpoints.watchdog_timeout = 0;
+        sim.state_manager.update_setpoints(setpoints).unwrap();
+        sim.update(Duration::from_millis(100)).await.unwrap();
+        let state = sim.state_manager.get_state().unwrap();
+        assert!(!state.status.faults.contains(&FaultCode::WatchdogTimeout), "disabling the watchdog must clear an already-latched fault");
+    }
+
+    #[tokio::test]
+    async fn test_watchdog_disabled_by_default_does_not_self_trip() {
+        // ControlSetpoints::default() must leave the watchdog disabled - nothing in
+        // this codebase (or a typical EMS that only writes on change) guarantees a
+        // periodic heartbeat, so a non-zero default would fault normal idle operation.
+        let mut sim = BatterySimulator::new();
+        let mut setpoints = ControlSetpoints::default();
+        setpoints.command = SystemCommand::Start;
+        assert_eq!(setpoints.watchdog_timeout, 0, "watchdog must be opt-in, not on by default");
+        sim.state_manager.update_setpoints(setpoints).unwrap();
+
+        sim.update(Duration::from_millis(100)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        sim.update(Duration::from_millis(100)).await.unwrap();
+
+        let state = sim.state_manager.get_state().unwrap();
+        assert!(!state.status.faults.contains(&FaultCode::WatchdogTimeout), "default (disabled) watchdog must never self-trip");
+    }
+
+    #[tokio::test]
+    async fn test_environment_and_meter_aux_load_agree_on_transition_tick() {
+        let mut sim = BatterySimulator::new();
+
+        let mut setpoints = ControlSetpoints::default();
+        setpoints.command = SystemCommand::Start;
+        sim.state_manager.update_setpoints(setpoints).unwrap();
+
+        // The very first tick after Start is exactly the Offline->Standby transition
+        // tick where update_environment and calculate_meter_params previously could
+        // disagree about which status to use.
+        sim.update(Duration::from_millis(100)).await.unwrap();
+
+        let state = sim.state_manager.get_state().unwrap();
+        assert_eq!(
+            state.info.aux_power_consumption, state.meter.aux_load_power,
+            "AUX_POWER_CONSUMPTION and meter aux load must agree on the transition tick"
+        );
     }
 
     #[tokio::test]
