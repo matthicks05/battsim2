@@ -488,13 +488,15 @@ impl ModbusRegisterMap {
 
         let mut config = BatteryConfig::default();
 
-        // Rated capacity (UINT32)
+        // Rated capacity (UINT32). Clamped to the same 100-1000 kWh range as
+        // BatteryStateManager::init_capacity so a write can't zero it out and
+        // divide-by-zero the aging/SOH math in simulation.rs.
         if let (Some(&high), Some(&low)) = (
             self.holding_registers.get(&RATED_CAPACITY),
             self.holding_registers.get(&(RATED_CAPACITY + 1))
         ) {
             let capacity_raw = ModbusConverter::words_to_uint32(high, low);
-            config.rated_capacity = ModbusConverter::uint32_to_f64_scaled(capacity_raw, 10.0);
+            config.rated_capacity = ModbusConverter::uint32_to_f64_scaled(capacity_raw, 10.0).clamp(100.0, 1000.0);
         }
 
         if let Some(power) = self.holding_registers.get(&RATED_POWER) {
@@ -503,8 +505,10 @@ impl ModbusRegisterMap {
         if let Some(reactive_power) = self.holding_registers.get(&RATED_REACTIVE_POWER) {
             config.rated_reactive_power = ModbusConverter::uint16_to_f64_scaled(*reactive_power, 1.0);
         }
+        // Clamped to a sane minimum: a 0 cell count divides-by-zero the open-circuit
+        // voltage and cell monitoring calculations in simulation.rs.
         if let Some(cells) = self.holding_registers.get(&CELL_COUNT) {
-            config.cell_count = *cells;
+            config.cell_count = (*cells).clamp(1, 1000);
         }
         if let Some(ac_voltage) = self.holding_registers.get(&RATED_AC_VOLTAGE) {
             config.rated_ac_voltage = ModbusConverter::uint16_to_f64_scaled(*ac_voltage, 1.0);
@@ -529,6 +533,19 @@ impl Default for ModbusRegisterMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_config_extraction_clamps_zero_cell_count_and_capacity() {
+        let mut map = ModbusRegisterMap::new();
+        map.write_holding_register(addresses::CELL_COUNT, 0).unwrap();
+        let (hi, lo) = ModbusConverter::uint32_to_words(0);
+        map.write_holding_register(addresses::RATED_CAPACITY, hi).unwrap();
+        map.write_holding_register(addresses::RATED_CAPACITY + 1, lo).unwrap();
+
+        let config = map.extract_config_from_registers().unwrap();
+        assert!(config.cell_count >= 1, "cell_count must never clamp to 0");
+        assert!(config.rated_capacity >= 100.0, "rated_capacity must never clamp to 0");
+    }
 
     #[test]
     fn test_data_type_conversions() {

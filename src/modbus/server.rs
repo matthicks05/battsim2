@@ -1,53 +1,169 @@
+use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use tokio::sync::{RwLock, watch};
+
+use anyhow::{Context, Result};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{timeout, Duration};
-use anyhow::{Result, Context};
-use tracing::{info, warn, error, debug};
+use tokio::sync::{watch, RwLock};
+use tokio::time::Duration;
+use tokio_io_timeout::TimeoutStream;
+use tokio_modbus::server::tcp::Server;
+use tokio_modbus::server::Service;
+use tokio_modbus::{Exception, Request, Response};
+use tokio_modbus::prelude::SlaveRequest;
+use tracing::{error, info, warn};
 
 use crate::battery::types::*;
-use super::registers::ModbusRegisterMap;
+use crate::battery::BatteryStateManager;
 use super::registers::addresses::{HOLDING_REGISTER_BASE, INPUT_REGISTER_BASE};
+use super::registers::ModbusRegisterMap;
 
-/// Modbus function codes
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum FunctionCode {
-    ReadHoldingRegisters = 0x03,
-    ReadInputRegisters = 0x04,
-    WriteSingleRegister = 0x06,
-    WriteMultipleRegisters = 0x10,
+/// A client that goes idle for this long (no bytes read) has its connection
+/// closed, releasing the socket and correcting MODBUS_CLIENT_COUNT — matches
+/// the pre-migration hand-rolled server's idle-read timeout.
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Translates a 0-based wire address into this map's internal 30001+/40001+
+/// addressing, rejecting anything that would overflow u16 arithmetic
+/// downstream (both here and in the `start_address..start_address+count`
+/// range math in `registers.rs`) instead of silently saturating to a wrong
+/// address or panicking on overflow.
+fn translate_address(wire_addr: u16, base: u16, count: u16) -> Result<u16, Exception> {
+    let internal_addr = wire_addr.checked_add(base).ok_or(Exception::IllegalDataAddress)?;
+    internal_addr
+        .checked_add(count)
+        .ok_or(Exception::IllegalDataAddress)?;
+    Ok(internal_addr)
 }
 
-/// Modbus exception codes
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ExceptionCode {
-    IllegalFunction = 0x01,
-    IllegalDataAddress = 0x02,
-    IllegalDataValue = 0x03,
-    SlaveDeviceFailure = 0x04,
+/// Applies a holding-register write to the register map, then forwards a
+/// setpoints/config update to the simulation if the write landed in one of
+/// those ranges (mirrors the pre-migration hand-rolled dispatch).
+fn send_register_updates(
+    register_map: &ModbusRegisterMap,
+    changed_address: u16,
+    setpoints_tx: &tokio::sync::mpsc::Sender<ControlSetpoints>,
+    config_tx: &tokio::sync::mpsc::Sender<BatteryConfig>,
+) {
+    if (40001..=40100).contains(&changed_address) {
+        if let Ok(setpoints) = register_map.extract_setpoints_from_registers() {
+            if setpoints_tx.try_send(setpoints).is_err() {
+                tracing::debug!("Setpoints channel full, skipping update");
+            }
+        }
+    } else if (40101..=40200).contains(&changed_address) {
+        if let Ok(config) = register_map.extract_config_from_registers() {
+            if config_tx.try_send(config).is_err() {
+                tracing::debug!("Config channel full, skipping update");
+            }
+        }
+    }
 }
 
-/// Modbus request frame structure
-#[derive(Debug)]
-pub struct ModbusRequest {
-    pub transaction_id: u16,
-    pub protocol_id: u16,
-    pub length: u16,
-    pub unit_id: u8,
-    pub function_code: u8,
-    pub data: Vec<u8>,
+/// The actual Modbus request handler, shared (via `Arc`) across every client connection.
+struct BattsimService {
+    register_map: Arc<RwLock<ModbusRegisterMap>>,
+    setpoints_tx: tokio::sync::mpsc::Sender<ControlSetpoints>,
+    config_tx: tokio::sync::mpsc::Sender<BatteryConfig>,
+    unit_id: u8,
 }
 
-/// Modbus response frame structure
-#[derive(Debug)]
-pub struct ModbusResponse {
-    pub transaction_id: u16,
-    pub protocol_id: u16,
-    pub length: u16,
-    pub unit_id: u8,
-    pub function_code: u8,
-    pub data: Vec<u8>,
+impl Service for BattsimService {
+    type Request = SlaveRequest<'static>;
+    type Future = Pin<Box<dyn Future<Output = Result<Response, Exception>> + Send>>;
+
+    fn call(&self, req: Self::Request) -> Self::Future {
+        let register_map = self.register_map.clone();
+        let setpoints_tx = self.setpoints_tx.clone();
+        let config_tx = self.config_tx.clone();
+        let unit_id = self.unit_id;
+
+        Box::pin(async move {
+            if req.slave != unit_id {
+                return Err(Exception::ServerDeviceFailure);
+            }
+
+            match req.request {
+                Request::ReadHoldingRegisters(addr, count) => {
+                    if count == 0 || count > 125 {
+                        return Err(Exception::IllegalDataValue);
+                    }
+                    let internal_addr = translate_address(addr, HOLDING_REGISTER_BASE, count)?;
+                    let map = register_map.read().await;
+                    let values = map.read_holding_registers(internal_addr, count);
+                    Ok(Response::ReadHoldingRegisters(values))
+                }
+                Request::ReadInputRegisters(addr, count) => {
+                    if count == 0 || count > 125 {
+                        return Err(Exception::IllegalDataValue);
+                    }
+                    let internal_addr = translate_address(addr, INPUT_REGISTER_BASE, count)?;
+                    let map = register_map.read().await;
+                    let values = map.read_input_registers(internal_addr, count);
+                    Ok(Response::ReadInputRegisters(values))
+                }
+                Request::WriteSingleRegister(addr, value) => {
+                    let internal_addr = translate_address(addr, HOLDING_REGISTER_BASE, 1)?;
+                    {
+                        let mut map = register_map.write().await;
+                        let _ = map.write_holding_register(internal_addr, value);
+                        send_register_updates(&map, internal_addr, &setpoints_tx, &config_tx);
+                    }
+                    // Echo back the original wire address, not the translated one.
+                    Ok(Response::WriteSingleRegister(addr, value))
+                }
+                Request::WriteMultipleRegisters(addr, values) => {
+                    if values.is_empty() || values.len() > 123 {
+                        return Err(Exception::IllegalDataValue);
+                    }
+                    let count = values.len() as u16;
+                    let internal_addr = translate_address(addr, HOLDING_REGISTER_BASE, count)?;
+                    {
+                        let mut map = register_map.write().await;
+                        let _ = map.write_holding_registers(internal_addr, &values);
+                        for i in 0..count {
+                            send_register_updates(&map, internal_addr + i, &setpoints_tx, &config_tx);
+                        }
+                    }
+                    Ok(Response::WriteMultipleRegisters(addr, count))
+                }
+                _ => Err(Exception::IllegalFunction),
+            }
+        })
+    }
+}
+
+/// Per-connection wrapper: delegates to the shared `BattsimService` and tracks
+/// the live client count for the lifetime of this TCP connection (decrementing
+/// on drop, i.e. when the connection closes for any reason), pushing the
+/// updated count into the shared battery state so it's visible on the
+/// MODBUS_CLIENT_COUNT register and the TUI.
+struct ConnectionService {
+    inner: Arc<BattsimService>,
+    client_count: Arc<AtomicU32>,
+    state_manager: BatteryStateManager,
+    peer_addr: SocketAddr,
+}
+
+impl Drop for ConnectionService {
+    fn drop(&mut self) {
+        let count = self.client_count.fetch_sub(1, Ordering::SeqCst) - 1;
+        if let Err(e) = self.state_manager.set_modbus_clients(count) {
+            error!("Failed to update Modbus client count: {}", e);
+        }
+        info!("Client {} disconnected", self.peer_addr);
+    }
+}
+
+impl Service for ConnectionService {
+    type Request = <BattsimService as Service>::Request;
+    type Future = <BattsimService as Service>::Future;
+
+    fn call(&self, req: Self::Request) -> Self::Future {
+        self.inner.call(req)
+    }
 }
 
 /// Modbus TCP server
@@ -56,7 +172,8 @@ pub struct ModbusTcpServer {
     battery_state_rx: watch::Receiver<BatteryState>,
     setpoints_tx: tokio::sync::mpsc::Sender<ControlSetpoints>,
     config_tx: tokio::sync::mpsc::Sender<BatteryConfig>,
-    client_count: Arc<RwLock<u32>>,
+    client_count: Arc<AtomicU32>,
+    state_manager: BatteryStateManager,
     unit_id: u8,
 }
 
@@ -66,25 +183,29 @@ impl ModbusTcpServer {
         battery_state_rx: watch::Receiver<BatteryState>,
         setpoints_tx: tokio::sync::mpsc::Sender<ControlSetpoints>,
         config_tx: tokio::sync::mpsc::Sender<BatteryConfig>,
+        state_manager: BatteryStateManager,
     ) -> Self {
         Self {
             register_map: Arc::new(RwLock::new(ModbusRegisterMap::new())),
             battery_state_rx,
             setpoints_tx,
             config_tx,
-            client_count: Arc::new(RwLock::new(0)),
+            client_count: Arc::new(AtomicU32::new(0)),
+            state_manager,
             unit_id: 1, // Default unit ID
         }
     }
 
     /// Start the Modbus TCP server
     pub async fn start(&self, bind_address: &str) -> Result<()> {
-        let listener = TcpListener::bind(bind_address).await
+        let listener = TcpListener::bind(bind_address)
+            .await
             .with_context(|| format!("Failed to bind to {}", bind_address))?;
-        
+
         info!("Modbus TCP server listening on {}", bind_address);
 
-        // Start register update task
+        // Start register update task: keeps the register map in sync with the
+        // live battery state, independent of any client connection.
         let register_map = self.register_map.clone();
         let mut battery_rx = self.battery_state_rx.clone();
         tokio::spawn(async move {
@@ -100,398 +221,58 @@ impl ModbusTcpServer {
             }
         });
 
-        // Accept client connections
-        while let Ok((stream, addr)) = listener.accept().await {
-            info!("New Modbus client connected from {}", addr);
-            
-            // Increment client count
-            {
-                let mut count = self.client_count.write().await;
-                *count += 1;
-            }
+        let service = Arc::new(BattsimService {
+            register_map: self.register_map.clone(),
+            setpoints_tx: self.setpoints_tx.clone(),
+            config_tx: self.config_tx.clone(),
+            unit_id: self.unit_id,
+        });
+        let client_count = self.client_count.clone();
+        let state_manager = self.state_manager.clone();
 
-            // Handle client in separate task
-            let server = self.clone();
-            tokio::spawn(async move {
-                if let Err(e) = server.handle_client(stream).await {
-                    warn!("Client {} disconnected with error: {}", addr, e);
-                } else {
-                    info!("Client {} disconnected cleanly", addr);
+        let on_connected = move |stream: TcpStream, peer_addr: SocketAddr| {
+            let inner = service.clone();
+            let client_count = client_count.clone();
+            let state_manager = state_manager.clone();
+            async move {
+                let count = client_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Err(e) = state_manager.set_modbus_clients(count) {
+                    error!("Failed to update Modbus client count: {}", e);
                 }
-                
-                // Decrement client count
-                let mut count = server.client_count.write().await;
-                *count = count.saturating_sub(1);
-            });
-        }
+                info!("New Modbus client connected from {}", peer_addr);
+
+                let mut timeout_stream = TimeoutStream::new(stream);
+                timeout_stream.set_read_timeout(Some(CLIENT_IDLE_TIMEOUT));
+                // TimeoutStream isn't Unpin (it holds a pinned `Sleep` internally),
+                // but Server::serve requires an Unpin transport; Pin<Box<T>> is
+                // always Unpin regardless of T, so box-pin it after configuring.
+                let timeout_stream = Box::pin(timeout_stream);
+
+                Ok(Some((
+                    ConnectionService {
+                        inner,
+                        client_count,
+                        state_manager,
+                        peer_addr,
+                    },
+                    timeout_stream,
+                )))
+            }
+        };
+
+        let server = Server::new(listener);
+        server
+            .serve(&on_connected, |e| {
+                warn!("Modbus connection error: {}", e);
+            })
+            .await?;
 
         Ok(())
     }
 
     /// Get current client count
     pub async fn get_client_count(&self) -> u32 {
-        *self.client_count.read().await
-    }
-
-    /// Handle a single client connection
-    async fn handle_client(&self, mut stream: TcpStream) -> Result<()> {
-        let mut buffer = vec![0u8; 1024];
-        
-        loop {
-            // Read request with timeout
-            let bytes_read = match timeout(Duration::from_secs(30), stream.read(&mut buffer)).await {
-                Ok(Ok(0)) => break, // Client disconnected
-                Ok(Ok(n)) => n,
-                Ok(Err(e)) => return Err(e.into()),
-                Err(_) => {
-                    warn!("Client read timeout");
-                    break;
-                }
-            };
-
-            debug!("Received {} bytes from client", bytes_read);
-
-            // Parse request
-            let request = match self.parse_request(&buffer[..bytes_read]) {
-                Ok(req) => req,
-                Err(e) => {
-                    error!("Failed to parse Modbus request: {}", e);
-                    continue;
-                }
-            };
-
-            // Process request and generate response
-            let response = self.process_request(request).await;
-            
-            // Send response
-            let response_bytes = self.serialize_response(&response)?;
-            if let Err(e) = stream.write_all(&response_bytes).await {
-                error!("Failed to send response: {}", e);
-                break;
-            }
-
-            debug!("Sent {} bytes response to client", response_bytes.len());
-        }
-
-        Ok(())
-    }
-
-    /// Parse Modbus TCP request
-    fn parse_request(&self, data: &[u8]) -> Result<ModbusRequest> {
-        if data.len() < 8 {
-            return Err(anyhow::anyhow!("Request too short"));
-        }
-
-        let transaction_id = u16::from_be_bytes([data[0], data[1]]);
-        let protocol_id = u16::from_be_bytes([data[2], data[3]]);
-        let length = u16::from_be_bytes([data[4], data[5]]);
-        let unit_id = data[6];
-        let function_code = data[7];
-
-        if protocol_id != 0 {
-            return Err(anyhow::anyhow!("Invalid protocol ID: {}", protocol_id));
-        }
-
-        if data.len() < (6 + length as usize) {
-            return Err(anyhow::anyhow!("Incomplete request"));
-        }
-
-        let request_data = data[8..(6 + length as usize)].to_vec();
-
-        Ok(ModbusRequest {
-            transaction_id,
-            protocol_id,
-            length,
-            unit_id,
-            function_code,
-            data: request_data,
-        })
-    }
-
-    /// Process Modbus request and generate response
-    async fn process_request(&self, request: ModbusRequest) -> ModbusResponse {
-        // Check unit ID
-        if request.unit_id != self.unit_id {
-            return self.create_exception_response(
-                request.transaction_id, 
-                request.unit_id, 
-                request.function_code, 
-                ExceptionCode::SlaveDeviceFailure
-            );
-        }
-
-        match request.function_code {
-            0x03 => self.handle_read_holding_registers(request).await,
-            0x04 => self.handle_read_input_registers(request).await,
-            0x06 => self.handle_write_single_register(request).await,
-            0x10 => self.handle_write_multiple_registers(request).await,
-            _ => self.create_exception_response(
-                request.transaction_id,
-                request.unit_id,
-                request.function_code,
-                ExceptionCode::IllegalFunction
-            ),
-        }
-    }
-
-    /// Handle read holding registers (function code 03)
-    async fn handle_read_holding_registers(&self, request: ModbusRequest) -> ModbusResponse {
-        if request.data.len() != 4 {
-            return self.create_exception_response(
-                request.transaction_id, 
-                request.unit_id, 
-                request.function_code,
-                ExceptionCode::IllegalDataValue
-            );
-        }
-
-        // Wire addresses are 0-based per Modbus TCP; translate to this map's internal 40001+ addressing.
-        let start_address = u16::from_be_bytes([request.data[0], request.data[1]]).saturating_add(HOLDING_REGISTER_BASE);
-        let register_count = u16::from_be_bytes([request.data[2], request.data[3]]);
-
-        if register_count > 125 || register_count == 0 {
-            return self.create_exception_response(
-                request.transaction_id,
-                request.unit_id,
-                request.function_code,
-                ExceptionCode::IllegalDataValue
-            );
-        }
-
-        let register_map = self.register_map.read().await;
-        let register_values = register_map.read_holding_registers(start_address, register_count);
-        
-        let mut response_data = vec![register_count as u8 * 2]; // Byte count
-        for value in register_values {
-            response_data.extend_from_slice(&value.to_be_bytes());
-        }
-
-        ModbusResponse {
-            transaction_id: request.transaction_id,
-            protocol_id: 0,
-            // MBAP Length = bytes following the Length field: UnitID(1) + FunctionCode(1) + data
-            length: (2 + response_data.len()) as u16,
-            unit_id: request.unit_id,
-            function_code: request.function_code,
-            data: response_data,
-        }
-    }
-
-    /// Handle read input registers (function code 04)
-    async fn handle_read_input_registers(&self, request: ModbusRequest) -> ModbusResponse {
-        if request.data.len() != 4 {
-            return self.create_exception_response(
-                request.transaction_id,
-                request.unit_id,
-                request.function_code,
-                ExceptionCode::IllegalDataValue
-            );
-        }
-
-        // Wire addresses are 0-based per Modbus TCP; translate to this map's internal 30001+ addressing.
-        let start_address = u16::from_be_bytes([request.data[0], request.data[1]]).saturating_add(INPUT_REGISTER_BASE);
-        let register_count = u16::from_be_bytes([request.data[2], request.data[3]]);
-
-        if register_count > 125 || register_count == 0 {
-            return self.create_exception_response(
-                request.transaction_id,
-                request.unit_id,
-                request.function_code,
-                ExceptionCode::IllegalDataValue
-            );
-        }
-
-        let register_map = self.register_map.read().await;
-        let register_values = register_map.read_input_registers(start_address, register_count);
-        
-        let mut response_data = vec![register_count as u8 * 2]; // Byte count
-        for value in register_values {
-            response_data.extend_from_slice(&value.to_be_bytes());
-        }
-
-        ModbusResponse {
-            transaction_id: request.transaction_id,
-            protocol_id: 0,
-            // MBAP Length = bytes following the Length field: UnitID(1) + FunctionCode(1) + data
-            length: (2 + response_data.len()) as u16,
-            unit_id: request.unit_id,
-            function_code: request.function_code,
-            data: response_data,
-        }
-    }
-
-    /// Handle write single register (function code 06)
-    async fn handle_write_single_register(&self, request: ModbusRequest) -> ModbusResponse {
-        if request.data.len() != 4 {
-            return self.create_exception_response(
-                request.transaction_id,
-                request.unit_id,
-                request.function_code,
-                ExceptionCode::IllegalDataValue
-            );
-        }
-
-        // Wire addresses are 0-based per Modbus TCP; translate to this map's internal 40001+ addressing.
-        let register_address = u16::from_be_bytes([request.data[0], request.data[1]]).saturating_add(HOLDING_REGISTER_BASE);
-        let register_value = u16::from_be_bytes([request.data[2], request.data[3]]);
-
-        // Write to register map
-        {
-            let mut register_map = self.register_map.write().await;
-            if register_map.write_holding_register(register_address, register_value).is_err() {
-                return self.create_exception_response(
-                    request.transaction_id,
-                    request.unit_id,
-                    request.function_code,
-                    ExceptionCode::IllegalDataAddress
-                );
-            }
-
-            // Extract and send setpoints/config changes
-            if let Err(e) = self.send_register_updates(&register_map, register_address).await {
-                error!("Failed to send register updates: {}", e);
-            }
-        }
-
-        // Echo back the request (standard Modbus response for function 06)
-        ModbusResponse {
-            transaction_id: request.transaction_id,
-            protocol_id: 0,
-            length: 6,
-            unit_id: request.unit_id,
-            function_code: request.function_code,
-            data: request.data,
-        }
-    }
-
-    /// Handle write multiple registers (function code 16)
-    async fn handle_write_multiple_registers(&self, request: ModbusRequest) -> ModbusResponse {
-        if request.data.len() < 5 {
-            return self.create_exception_response(
-                request.transaction_id,
-                request.unit_id,
-                request.function_code,
-                ExceptionCode::IllegalDataValue
-            );
-        }
-
-        // Wire addresses are 0-based per Modbus TCP; translate to this map's internal 40001+ addressing.
-        let start_address = u16::from_be_bytes([request.data[0], request.data[1]]).saturating_add(HOLDING_REGISTER_BASE);
-        let register_count = u16::from_be_bytes([request.data[2], request.data[3]]);
-        let byte_count = request.data[4] as usize;
-
-        if register_count > 123 || register_count == 0 || byte_count != register_count as usize * 2 {
-            return self.create_exception_response(
-                request.transaction_id,
-                request.unit_id,
-                request.function_code,
-                ExceptionCode::IllegalDataValue
-            );
-        }
-
-        if request.data.len() != (5 + byte_count) {
-            return self.create_exception_response(
-                request.transaction_id,
-                request.unit_id,
-                request.function_code,
-                ExceptionCode::IllegalDataValue
-            );
-        }
-
-        // Parse register values
-        let mut register_values = Vec::new();
-        for i in 0..register_count {
-            let offset = 5 + (i as usize * 2);
-            let value = u16::from_be_bytes([request.data[offset], request.data[offset + 1]]);
-            register_values.push(value);
-        }
-
-        // Write to register map
-        {
-            let mut register_map = self.register_map.write().await;
-            if register_map.write_holding_registers(start_address, &register_values).is_err() {
-                return self.create_exception_response(
-                    request.transaction_id,
-                    request.unit_id,
-                    request.function_code,
-                    ExceptionCode::IllegalDataAddress
-                );
-            }
-
-            // Extract and send setpoints/config changes
-            for i in 0..register_count {
-                if let Err(e) = self.send_register_updates(&register_map, start_address + i).await {
-                    error!("Failed to send register updates: {}", e);
-                }
-            }
-        }
-
-        // Response contains start address and register count
-        let response_data = vec![
-            request.data[0], request.data[1], // Start address  
-            request.data[2], request.data[3], // Register count
-        ];
-
-        ModbusResponse {
-            transaction_id: request.transaction_id,
-            protocol_id: 0,
-            length: 6,
-            unit_id: request.unit_id,
-            function_code: request.function_code,
-            data: response_data,
-        }
-    }
-
-    /// Send register updates to battery simulation
-    async fn send_register_updates(&self, register_map: &ModbusRegisterMap, changed_address: u16) -> Result<()> {
-        // Check if this is a setpoint or config register
-        if (40001..=40100).contains(&changed_address) {
-            // Control setpoints range
-            let setpoints = register_map.extract_setpoints_from_registers()?;
-            if self.setpoints_tx.try_send(setpoints).is_err() {
-                debug!("Setpoints channel full, skipping update");
-            }
-        } else if (40101..=40200).contains(&changed_address) {
-            // Configuration range  
-            let config = register_map.extract_config_from_registers()?;
-            if self.config_tx.try_send(config).is_err() {
-                debug!("Config channel full, skipping update");
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Create exception response
-    fn create_exception_response(
-        &self,
-        transaction_id: u16,
-        unit_id: u8,
-        function_code: u8,
-        exception_code: ExceptionCode,
-    ) -> ModbusResponse {
-        ModbusResponse {
-            transaction_id,
-            protocol_id: 0,
-            length: 3,
-            unit_id,
-            function_code: function_code | 0x80, // Set exception bit
-            data: vec![exception_code as u8],
-        }
-    }
-
-    /// Serialize Modbus response to bytes
-    fn serialize_response(&self, response: &ModbusResponse) -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        
-        bytes.extend_from_slice(&response.transaction_id.to_be_bytes());
-        bytes.extend_from_slice(&response.protocol_id.to_be_bytes());
-        bytes.extend_from_slice(&response.length.to_be_bytes());
-        bytes.push(response.unit_id);
-        bytes.push(response.function_code);
-        bytes.extend_from_slice(&response.data);
-        
-        Ok(bytes)
+        self.client_count.load(Ordering::SeqCst)
     }
 }
 
@@ -503,6 +284,7 @@ impl Clone for ModbusTcpServer {
             setpoints_tx: self.setpoints_tx.clone(),
             config_tx: self.config_tx.clone(),
             client_count: self.client_count.clone(),
+            state_manager: self.state_manager.clone(),
             unit_id: self.unit_id,
         }
     }
@@ -512,61 +294,92 @@ impl Clone for ModbusTcpServer {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+    use tokio_modbus::slave::SlaveId;
 
-    #[test]
-    fn test_request_parsing() {
-        // Create mock channels for testing
-        let (state_tx, state_rx) = watch::channel(BatteryState::default());
-        let (setpoints_tx, _) = mpsc::channel(10);
-        let (config_tx, _) = mpsc::channel(10);
-        
-        let server = ModbusTcpServer::new(state_rx, setpoints_tx, config_tx);
-
-        // Test read holding registers request
-        let request_bytes = vec![
-            0x00, 0x01, // Transaction ID
-            0x00, 0x00, // Protocol ID  
-            0x00, 0x06, // Length
-            0x01,       // Unit ID
-            0x03,       // Function code (read holding registers)
-            0x9C, 0x41, // Start address (40001)
-            0x00, 0x02, // Register count (2)
-        ];
-
-        let request = server.parse_request(&request_bytes).unwrap();
-        assert_eq!(request.transaction_id, 1);
-        assert_eq!(request.function_code, 0x03);
-        assert_eq!(request.unit_id, 1);
-        assert_eq!(request.data, vec![0x9C, 0x41, 0x00, 0x02]);
+    fn make_service() -> BattsimService {
+        BattsimService {
+            register_map: Arc::new(RwLock::new(ModbusRegisterMap::new())),
+            setpoints_tx: mpsc::channel(10).0,
+            config_tx: mpsc::channel(10).0,
+            unit_id: 1,
+        }
     }
 
-    #[test]
-    fn test_response_serialization() {
-        let (state_tx, state_rx) = watch::channel(BatteryState::default());
-        let (setpoints_tx, _) = mpsc::channel(10);
-        let (config_tx, _) = mpsc::channel(10);
-        
-        let server = ModbusTcpServer::new(state_rx, setpoints_tx, config_tx);
+    fn slave_request(request: Request<'static>) -> SlaveRequest<'static> {
+        SlaveRequest {
+            slave: 1 as SlaveId,
+            request,
+        }
+    }
 
-        let response = ModbusResponse {
-            transaction_id: 1,
-            protocol_id: 0,
-            length: 5,
-            unit_id: 1,
-            function_code: 0x03,
-            data: vec![0x02, 0x12, 0x34], // 2 bytes of data: 0x1234
-        };
+    #[tokio::test]
+    async fn test_read_input_registers_roundtrip() {
+        let service = make_service();
+        let state = BatteryState::default();
+        {
+            let mut map = service.register_map.write().await;
+            map.update_input_registers(&state).unwrap();
+        }
 
-        let serialized = server.serialize_response(&response).unwrap();
-        let expected = vec![
-            0x00, 0x01, // Transaction ID
-            0x00, 0x00, // Protocol ID
-            0x00, 0x05, // Length
-            0x01,       // Unit ID
-            0x03,       // Function code
-            0x02, 0x12, 0x34, // Data
-        ];
+        // SOC lives at internal address 30201 -> wire offset 200
+        let response = service
+            .call(slave_request(Request::ReadInputRegisters(200, 1)))
+            .await
+            .unwrap();
 
-        assert_eq!(serialized, expected);
+        match response {
+            Response::ReadInputRegisters(values) => {
+                assert_eq!(values, vec![850]); // 85.0% * 10, per ElectricalParams default
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_single_register_roundtrip() {
+        let service = make_service();
+
+        // COMMAND lives at internal address 40001 -> wire offset 0
+        let response = service
+            .call(slave_request(Request::WriteSingleRegister(0, 1)))
+            .await
+            .unwrap();
+        assert_eq!(response, Response::WriteSingleRegister(0, 1));
+
+        let map = service.register_map.read().await;
+        assert_eq!(map.read_holding_register(addresses_command()), Some(1));
+    }
+
+    fn addresses_command() -> u16 {
+        super::super::registers::addresses::COMMAND
+    }
+
+    #[tokio::test]
+    async fn test_wrong_unit_id_rejected() {
+        let service = make_service();
+        let mut req = slave_request(Request::ReadInputRegisters(200, 1));
+        req.slave = 99;
+        let result = service.call(req).await;
+        assert_eq!(result, Err(Exception::ServerDeviceFailure));
+    }
+
+    #[tokio::test]
+    async fn test_out_of_range_address_rejected_not_panicking() {
+        let service = make_service();
+        // Translating this wire address (65500) into internal 30001+ addressing
+        // would overflow u16 arithmetic downstream if not caught up front.
+        let result = service
+            .call(slave_request(Request::ReadInputRegisters(65500, 50)))
+            .await;
+        assert_eq!(result, Err(Exception::IllegalDataAddress));
+    }
+
+    #[tokio::test]
+    async fn test_write_out_of_range_address_rejected_not_panicking() {
+        let service = make_service();
+        let result = service
+            .call(slave_request(Request::WriteSingleRegister(65530, 1)))
+            .await;
+        assert_eq!(result, Err(Exception::IllegalDataAddress));
     }
 }

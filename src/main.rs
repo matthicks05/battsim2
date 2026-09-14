@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
     // apply them to the shared battery state so they actually reach the simulation.
     let (setpoints_tx, mut setpoints_rx) = tokio::sync::mpsc::channel::<ControlSetpoints>(100);
     let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<BatteryConfig>(100);
-    let modbus_server = ModbusTcpServer::new(battery_rx.clone(), setpoints_tx, config_tx);
+    let modbus_server = ModbusTcpServer::new(battery_rx.clone(), setpoints_tx, config_tx, state_manager.clone());
     info!("Modbus server initialized");
 
     let setpoints_state_manager = state_manager.clone();
